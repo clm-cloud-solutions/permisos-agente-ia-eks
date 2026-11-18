@@ -1,0 +1,31 @@
+# Tráfico constante contra la tienda (una petición por segundo), para que un
+# fallo de orders-api se vea enseguida en los logs, en las métricas y en KubeBolt.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen
+  namespace: shop-frontend
+  labels: {app: loadgen, tier: frontend}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: loadgen}
+  template:
+    metadata:
+      labels: {app: loadgen, tier: frontend}
+    spec:
+      containers:
+        - name: loadgen
+          image: public.ecr.aws/docker/library/alpine:3.20
+          command: ["sh", "-c"]
+          args:
+            - |
+              echo "[loadgen] GET http://shop-web.shop-frontend/ una vez por segundo"
+              while true; do
+                code=$(wget -q -O /dev/null -S "http://shop-web.shop-frontend/" 2>&1 | awk '/HTTP\//{print $2; exit}')
+                echo "[loadgen] shop-web -> ${code:-ERR}"
+                sleep 1
+              done
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 100m, memory: 64Mi}

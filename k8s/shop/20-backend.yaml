@@ -1,0 +1,283 @@
+# Capa de APIs: orders-api y catalog-api, el mismo servidor con otra consulta.
+#
+#   GET /livez   200 siempre (el proceso vive)
+#   GET /readyz  hace login en la base y corre SELECT 1. Es la readiness: si la
+#                base rechaza la contraseña, el pod sale del Service y la tienda
+#                lo nota. Con una readiness que solo probara el puerto, los pods
+#                seguirían Ready mientras cada petición falla, y KubeBolt no
+#                tendría un síntoma de Kubernetes con el que abrir un incidente.
+#   GET /        corre $QUERY: 200 con el resultado, 500 con el error de
+#                PostgreSQL (mensaje y SQLSTATE), 503 si no llega a la base.
+#
+# La contraseña llega por variable de entorno al arrancar el pod. Si se rota, el
+# pod sigue con la vieja hasta que se reinicia: es el incidente del laboratorio.
+#
+# Driver: pg8000, puro Python, instalado con pip al arrancar (sin imagen propia).
+# Base y TLS salen del ConfigMap shop-db, que crea el script de cada modo:
+#   aws    host = el endpoint de RDS, sslmode = verify-full: cadena verificada
+#          contra la CA de RDS (ConfigMap db-ca) y nombre del host comprobado
+#   local  host = shop-db.shop-data (PostgreSQL en el clúster), sslmode = disable
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-server
+  namespace: shop-backend
+  labels: {app.kubernetes.io/part-of: kubeshop}
+data:
+  server.py: |
+    import os, socket, json, time, ssl, threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import pg8000.native
+    from pg8000.exceptions import DatabaseError
+
+    DB_HOST = os.environ["DB_HOST"]
+    DB_PORT = int(os.environ.get("DB_PORT", "5432"))
+    DB_NAME = os.environ.get("DB_NAME", "shop")
+    DB_USER = os.environ["DB_USER"]
+    DB_PASSWORD = os.environ["DB_PASSWORD"]
+    QUERY = os.environ["QUERY"]
+    SERVICE = os.environ.get("SERVICE_NAME", "backend")
+    DB_SSLMODE = os.environ.get("DB_SSLMODE", "verify-full")   # verify-full | disable
+
+    # verify-full: cadena (SSL_CERT_FILE apunta a la CA de RDS) y nombre del host.
+    TLS = None if DB_SSLMODE == "disable" else ssl.create_default_context()
+
+    _lock = threading.Lock()
+    _conn = None
+    _ready_err, _ready_logged = None, 0.0
+
+    def log(level, msg):
+        print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} [{SERVICE}] {level} {msg}", flush=True)
+
+    def pg_error(e):
+        # pg8000 deja los campos del ErrorResponse en args[0]: M=mensaje, C=SQLSTATE
+        f = e.args[0] if e.args and isinstance(e.args[0], dict) else {}
+        return f"{f.get('M', str(e))} (SQLSTATE {f.get('C', '?')})"
+
+    def run(sql):
+        """(filas, None) | (None, ("sql", msg)) | (None, ("conn", msg))."""
+        global _conn
+        with _lock:
+            for attempt in (1, 2):
+                try:
+                    if _conn is None:
+                        _conn = pg8000.native.Connection(
+                            DB_USER, host=DB_HOST, port=DB_PORT, database=DB_NAME,
+                            password=DB_PASSWORD, ssl_context=TLS, timeout=5,
+                            application_name=SERVICE)
+                    return _conn.run(sql), None
+                except DatabaseError as e:
+                    # El servidor rechazó la sentencia, o el login (28P01).
+                    try:
+                        _conn.close()
+                    except Exception:
+                        pass
+                    _conn = None
+                    if attempt == 2:
+                        return None, ("sql", pg_error(e))
+                except Exception as e:
+                    # Conexión rota (p. ej. la sesión la cerró la rotación): una vez más.
+                    try:
+                        _conn.close()
+                    except Exception:
+                        pass
+                    _conn = None
+                    if attempt == 2:
+                        return None, ("conn", str(e) or type(e).__name__)
+
+    class H(BaseHTTPRequestHandler):
+        def _send(self, code, payload):
+            body = json.dumps(payload, default=str).encode()
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def do_GET(self):
+            global _ready_err, _ready_logged
+            if self.path == "/livez":
+                self._send(200, {"service": SERVICE, "live": True})
+                return
+            if self.path == "/readyz":
+                rows, err = run("SELECT 1")
+                if err is None:
+                    if _ready_err:
+                        log("INFO", "readiness ok again: database login works")
+                    _ready_err = None
+                    self._send(200, {"service": SERVICE, "ready": True})
+                    return
+                self._send(503, {"service": SERVICE, "ready": False, "error": err[1]})
+                # Una línea al cambiar el error y una por minuto mientras dure.
+                now = time.time()
+                if err[1] != _ready_err or now - _ready_logged > 60:
+                    log("WARN", f"readiness failed: database login: {err[1]}")
+                    _ready_err, _ready_logged = err[1], now
+                return
+            start = time.time()
+            rows, err = run(QUERY)
+            ms = int((time.time() - start) * 1000)
+            if err is None:
+                self._send(200, {"service": SERVICE, "rows": rows})
+                log("INFO", f"GET {self.path} -> 200 rows={len(rows)} {ms}ms")
+            elif err[0] == "sql":
+                self._send(500, {"service": SERVICE, "error": err[1]})
+                log("ERROR", f"GET {self.path} -> 500 query failed: {err[1]} {ms}ms")
+            else:
+                self._send(503, {"service": SERVICE, "error": "cannot reach database"})
+                log("ERROR", f"GET {self.path} -> 503 db=unreachable ({err[1]}) {ms}ms")
+
+        def log_message(self, *args):
+            pass
+
+    log("INFO", f"listening on :8080, db {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
+    ThreadingHTTPServer(("0.0.0.0", 8080), H).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-api
+  namespace: shop-backend
+  labels: {app: orders-api, tier: backend}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: orders-api}
+  template:
+    metadata:
+      labels: {app: orders-api, tier: backend}
+    spec:
+      volumes:
+        - {name: server, configMap: {name: backend-server}}
+        - {name: db-ca, configMap: {name: db-ca}}
+      containers:
+        - name: app
+          image: public.ecr.aws/docker/library/python:3.12-alpine
+          command:
+            - sh
+            - -c
+            # scramp va fijado: pg8000 1.31.2 pide scramp>=1.4.5 y la 1.5.0 rompe la API.
+            - >-
+              pip install --quiet --no-cache-dir --disable-pip-version-check pg8000==1.31.2 scramp==1.4.18
+              && if [ -s /etc/db-ca/bundle.pem ]; then export SSL_CERT_FILE=/etc/db-ca/bundle.pem; fi
+              && exec python -u /app/server.py
+          env:
+            - {name: SERVICE_NAME, value: orders-api}
+            - name: DB_HOST
+              valueFrom: {configMapKeyRef: {name: shop-db, key: host}}
+            - name: DB_SSLMODE
+              valueFrom: {configMapKeyRef: {name: shop-db, key: sslmode}}
+            - name: DB_USER
+              valueFrom: {secretKeyRef: {name: orders-db-credentials, key: username}}
+            - name: DB_PASSWORD
+              valueFrom: {secretKeyRef: {name: orders-db-credentials, key: password}}
+            - name: QUERY
+              # Ingresos por estado en los últimos 30 días.
+              value: >-
+                SELECT status, count(*) AS orders, sum(amount) AS revenue
+                FROM orders WHERE created_at > now() - interval '30 days'
+                GROUP BY status ORDER BY status
+          ports:
+            - {name: http, containerPort: 8080}
+          volumeMounts:
+            - {name: server, mountPath: /app}
+            - {name: db-ca, mountPath: /etc/db-ca, readOnly: true}
+          livenessProbe:
+            httpGet: {path: /livez, port: http}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests: {cpu: 25m, memory: 48Mi}
+            limits: {cpu: 200m, memory: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders-api
+  namespace: shop-backend
+  labels: {app: orders-api, tier: backend}
+spec:
+  selector: {app: orders-api}
+  ports:
+    - {name: http, port: 80, targetPort: http}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog-api
+  namespace: shop-backend
+  labels: {app: catalog-api, tier: backend}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: catalog-api}
+  template:
+    metadata:
+      labels: {app: catalog-api, tier: backend}
+    spec:
+      volumes:
+        - {name: server, configMap: {name: backend-server}}
+        - {name: db-ca, configMap: {name: db-ca}}
+      containers:
+        - name: app
+          image: public.ecr.aws/docker/library/python:3.12-alpine
+          command:
+            - sh
+            - -c
+            - >-
+              pip install --quiet --no-cache-dir --disable-pip-version-check pg8000==1.31.2 scramp==1.4.18
+              && if [ -s /etc/db-ca/bundle.pem ]; then export SSL_CERT_FILE=/etc/db-ca/bundle.pem; fi
+              && exec python -u /app/server.py
+          env:
+            - {name: SERVICE_NAME, value: catalog-api}
+            - name: DB_HOST
+              valueFrom: {configMapKeyRef: {name: shop-db, key: host}}
+            - name: DB_SSLMODE
+              valueFrom: {configMapKeyRef: {name: shop-db, key: sslmode}}
+            - name: DB_USER
+              valueFrom: {secretKeyRef: {name: catalog-db-credentials, key: username}}
+            - name: DB_PASSWORD
+              valueFrom: {secretKeyRef: {name: catalog-db-credentials, key: password}}
+            - name: QUERY
+              # Resumen del catálogo con stock: tabla pequeña, rápida.
+              value: >-
+                SELECT count(*) AS in_stock, round(avg(price), 2) AS avg_price
+                FROM products WHERE stock > 0
+          ports:
+            - {name: http, containerPort: 8080}
+          volumeMounts:
+            - {name: server, mountPath: /app}
+            - {name: db-ca, mountPath: /etc/db-ca, readOnly: true}
+          livenessProbe:
+            httpGet: {path: /livez, port: http}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests: {cpu: 25m, memory: 48Mi}
+            limits: {cpu: 200m, memory: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalog-api
+  namespace: shop-backend
+  labels: {app: catalog-api, tier: backend}
+spec:
+  selector: {app: catalog-api}
+  ports:
+    - {name: http, port: 80, targetPort: http}

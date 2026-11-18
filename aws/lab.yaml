@@ -1,0 +1,313 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  permisos-agente-ia-eks - lo que el laboratorio necesita alrededor del cluster:
+  VPC con NAT, RDS PostgreSQL, el secreto de orders-api con su funcion de
+  rotacion, el rol de External Secrets y el rol de solo lectura que asume KubeBolt.
+  El cluster EKS lo crea eksctl encima de estas subredes (aws/cluster.yaml.tpl).
+
+# No se despliega a mano: scripts/aws-up.sh pone la politica de KubeBolt en
+# lugar de KUBEBOLT_POLICY (aws/kubebolt-policy.json), sube el paquete de la
+# Lambda y lanza `aws cloudformation deploy`.
+
+Parameters:
+  Name:
+    Type: String
+    Default: permisos-ia
+    AllowedPattern: "[a-z][a-z0-9-]{2,20}"
+    Description: Prefijo de todos los recursos.
+  LambdaBucket:
+    Type: String
+    Description: Bucket con el paquete de la funcion de rotacion.
+  LambdaKey:
+    Type: String
+    Description: Clave del paquete (rotation-<hash>.zip).
+  KubeBoltPrincipalArn:
+    Type: String
+    Default: ""
+    Description: >-
+      Quien asume el rol de solo lectura. Vacio = el rol del backend de KubeBolt
+      open source dentro del cluster (KubeBoltApiRole). Con KubeBolt Cloud, el
+      principal que muestra el asistente del conector de AWS.
+  KubeBoltExternalId:
+    Type: String
+    NoEcho: true
+    MinLength: 2
+    Description: External ID que KubeBolt presenta al asumir el rol.
+
+Conditions:
+  ExternalPrincipal: !Not [!Equals [!Ref KubeBoltPrincipalArn, ""]]
+
+Resources:
+  # ---- Red: 2 zonas, subredes publicas para el NAT, privadas para nodos, RDS y la Lambda
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Ref Name}]
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: !Ref Name}]
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway}
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.42.0.0/20
+      Tags: [{Key: Name, Value: !Sub "${Name}-public-a"}, {Key: kubernetes.io/role/elb, Value: "1"}]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: 10.42.16.0/20
+      Tags: [{Key: Name, Value: !Sub "${Name}-public-b"}, {Key: kubernetes.io/role/elb, Value: "1"}]
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.42.64.0/19
+      Tags: [{Key: Name, Value: !Sub "${Name}-private-a"}, {Key: kubernetes.io/role/internal-elb, Value: "1"}]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: 10.42.96.0/19
+      Tags: [{Key: Name, Value: !Sub "${Name}-private-b"}, {Key: kubernetes.io/role/internal-elb, Value: "1"}]
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "${Name}-public"}]
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties: {RouteTableId: !Ref PublicRouteTable, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway}
+  PublicSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable}
+  PublicSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable}
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags: [{Key: Name, Value: !Sub "${Name}-nat"}]
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags: [{Key: Name, Value: !Sub "${Name}-nat"}]
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "${Name}-private"}]
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties: {RouteTableId: !Ref PrivateRouteTable, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref NatGateway}
+  PrivateSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTable}
+  PrivateSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTable}
+
+  # ---- RDS PostgreSQL 16, privado, TLS obligatorio (rds.force_ssl es 1 por defecto desde PG 15)
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${Name} - PostgreSQL solo desde la VPC (pods, nodos y la funcion de rotacion)"
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 5432, ToPort: 5432, CidrIp: 10.42.0.0/16, Description: VPC del laboratorio}
+      Tags: [{Key: Name, Value: !Sub "${Name}-rds"}]
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${Name} - subredes privadas"
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+  Db:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete # datos de laboratorio: el job de seed los rehace
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${Name}-pg"
+      Engine: postgres
+      EngineVersion: "16"
+      DBInstanceClass: db.t4g.micro
+      AllocatedStorage: 20
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: shop
+      MasterUsername: shopadmin
+      # La contrasena del administrador la crea y la guarda RDS en su propio
+      # secreto de Secrets Manager; el script la lee de ahi, nunca de disco.
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 0
+      DeletionProtection: false
+      AutoMinorVersionUpgrade: true
+
+  # ---- La contrasena de orders-api (rol orders_app) y su rotacion
+  OrdersDbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${Name}/orders-db"
+      Description: !Sub "${Name} - rol de base de datos de orders-api (orders_app)"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"orders_app"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+  RotationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${Name} - funcion de rotacion (solo salida: RDS y Secrets Manager por el NAT)"
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "${Name}-rotation"}]
+  RotationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Name}-rotation"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+      Policies:
+        - PolicyName: rotar-orders-db
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:UpdateSecretVersionStage
+                Resource: !Ref OrdersDbSecret
+  RotationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Name}-orders-db-rotation"
+      Description: !Sub "${Name} - rota el secreto ${Name}/orders-db"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: rotation.handler
+      Role: !GetAtt RotationRole.Arn
+      Code: {S3Bucket: !Ref LambdaBucket, S3Key: !Ref LambdaKey}
+      Timeout: 30
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        SecurityGroupIds: [!Ref RotationSecurityGroup]
+      Environment:
+        Variables: {DB_HOST: !GetAtt Db.Endpoint.Address, DB_PORT: "5432", DB_NAME: shop}
+  RotationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RotationFunction
+      Action: lambda:InvokeFunction
+      Principal: secretsmanager.amazonaws.com
+      SourceArn: !Ref OrdersDbSecret
+  # Rotacion configurada pero sin rotar al crearla: el rol orders_app todavia no
+  # existe en la base (lo crea el job app-roles). Cada 1000 dias, el maximo: en la
+  # practica solo rota cuando lo pide `make romper`.
+  OrdersDbRotation:
+    Type: AWS::SecretsManager::RotationSchedule
+    DependsOn: RotationPermission
+    Properties:
+      SecretId: !Ref OrdersDbSecret
+      RotationLambdaARN: !GetAtt RotationFunction.Arn
+      RotateImmediatelyOnUpdate: false
+      RotationRules: {AutomaticallyAfterDays: 1000}
+
+  # ---- External Secrets: lee ese secreto y nada mas (Pod Identity)
+  EsoRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Name}-eso"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: pods.eks.amazonaws.com}, Action: [sts:AssumeRole, sts:TagSession]}
+      Policies:
+        - PolicyName: leer-orders-db
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+                Resource: !Ref OrdersDbSecret
+
+  # ---- KubeBolt
+  # El backend de KubeBolt open source, si lo instalas en el cluster
+  # (make kubebolt con KUBEBOLT=oss): su unico permiso es asumir el rol de abajo.
+  KubeBoltApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Name}-kubebolt-api"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: pods.eks.amazonaws.com}, Action: [sts:AssumeRole, sts:TagSession]}
+      Policies:
+        - PolicyName: asumir-rol-de-lectura
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Name}-kubebolt-readonly"
+  # El rol que asume KubeBolt para leer la cuenta: la politica que recomienda
+  # KubeBolt (aws/kubebolt-policy.json, generada desde el codigo open source),
+  # con su Deny explicito sobre valores de secretos y datos. Ese Deny es el que
+  # ensena el ejercicio 2, y se mantiene aunque alguien adjunte despues una
+  # politica mas amplia.
+  KubeBoltReadOnlyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Name}-kubebolt-readonly"
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !If [ExternalPrincipal, !Ref KubeBoltPrincipalArn, !GetAtt KubeBoltApiRole.Arn]
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: {sts:ExternalId: !Ref KubeBoltExternalId}
+      Policies:
+        - PolicyName: kubebolt-readonly
+          PolicyDocument: KUBEBOLT_POLICY
+
+Outputs:
+  VpcId: {Value: !Ref Vpc}
+  PublicSubnetA: {Value: !Ref PublicSubnetA}
+  PublicSubnetB: {Value: !Ref PublicSubnetB}
+  PrivateSubnetA: {Value: !Ref PrivateSubnetA}
+  PrivateSubnetB: {Value: !Ref PrivateSubnetB}
+  AzA: {Value: !GetAtt PrivateSubnetA.AvailabilityZone}
+  AzB: {Value: !GetAtt PrivateSubnetB.AvailabilityZone}
+  DbEndpoint: {Value: !GetAtt Db.Endpoint.Address}
+  DbMasterSecretArn: {Value: !GetAtt Db.MasterUserSecret.SecretArn}
+  OrdersDbSecretArn: {Value: !Ref OrdersDbSecret}
+  RotationFunctionName: {Value: !Ref RotationFunction}
+  EsoRoleArn: {Value: !GetAtt EsoRole.Arn}
+  KubeBoltApiRoleArn: {Value: !GetAtt KubeBoltApiRole.Arn}
+  KubeBoltReadOnlyRoleArn: {Value: !GetAtt KubeBoltReadOnlyRole.Arn}

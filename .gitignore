@@ -1,0 +1,7 @@
+# Configuración y estado locales: kubeconfig, tokens, claves, renders.
+lab.env
+.lab/
+
+# Python
+__pycache__/
+*.pyc

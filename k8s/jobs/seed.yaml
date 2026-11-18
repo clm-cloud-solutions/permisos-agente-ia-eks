@@ -1,0 +1,72 @@
+# Crea el esquema de la tienda y lo llena de datos, desde dentro del clúster.
+# Idempotente: las tablas se crean IF NOT EXISTS y se llenan solo si están vacías.
+# Corre como el usuario administrador de la base (Secret shop-db-credentials).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: shop-db-seed
+  namespace: shop-backend
+  labels:
+    app.kubernetes.io/part-of: kubeshop
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: psql
+          image: public.ecr.aws/docker/library/postgres:16-alpine
+          env:
+            - name: PGHOST
+              valueFrom: {configMapKeyRef: {name: shop-db, key: host}}
+            - name: PGDATABASE
+              value: shop
+            - name: PGSSLMODE
+              valueFrom: {configMapKeyRef: {name: shop-db, key: sslmode}}
+            - name: PGSSLROOTCERT
+              value: /etc/db-ca/bundle.pem
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef: {name: shop-db-credentials, key: username}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef: {name: shop-db-credentials, key: password}
+          command: ["psql", "-v", "ON_ERROR_STOP=1", "-c"]
+          args:
+            - |
+              CREATE TABLE IF NOT EXISTS orders (
+                id          bigserial PRIMARY KEY,
+                customer_id int           NOT NULL,
+                amount      numeric(10,2) NOT NULL,
+                status      text          NOT NULL,
+                created_at  timestamptz   NOT NULL DEFAULT now()
+              );
+              CREATE TABLE IF NOT EXISTS products (
+                id    bigserial PRIMARY KEY,
+                sku   text          NOT NULL,
+                name  text          NOT NULL,
+                price numeric(10,2) NOT NULL,
+                stock int           NOT NULL
+              );
+              INSERT INTO orders (customer_id, amount, status, created_at)
+              SELECT (random()*5000)::int,
+                     round((random()*500)::numeric, 2),
+                     (ARRAY['paid','shipped','pending','refunded'])[1 + floor(random()*4)::int],
+                     now() - random() * interval '180 days'
+              FROM generate_series(1, 200000)
+              WHERE NOT EXISTS (SELECT 1 FROM orders);
+              INSERT INTO products (sku, name, price, stock)
+              SELECT 'SKU-' || g, 'Product ' || g,
+                     round((random()*200)::numeric, 2), (random()*100)::int
+              FROM generate_series(1, 5000) g
+              WHERE NOT EXISTS (SELECT 1 FROM products);
+              ANALYZE orders; ANALYZE products;
+              SELECT 'orders' AS t, count(*) FROM orders
+              UNION ALL SELECT 'products', count(*) FROM products;
+          volumeMounts:
+            - {name: db-ca, mountPath: /etc/db-ca, readOnly: true}
+          resources:
+            requests: {cpu: 25m, memory: 32Mi}
+            limits: {cpu: 200m, memory: 128Mi}
+      volumes:
+        - {name: db-ca, configMap: {name: db-ca}}

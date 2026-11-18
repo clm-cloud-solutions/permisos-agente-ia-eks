@@ -1,0 +1,55 @@
+# Local: PostgreSQL 16 dentro del clúster, en shop-data, con un volumen de la
+# StorageClass por defecto de kind. Sin TLS (ConfigMap shop-db: sslmode=disable).
+# La contraseña del administrador la genera scripts/local-up.sh en el Secret
+# shop-data/postgres-admin.
+apiVersion: v1
+kind: Service
+metadata:
+  name: shop-db
+  namespace: shop-data
+  labels: {app: shop-db, tier: data}
+spec:
+  selector: {app: shop-db}
+  ports:
+    - {name: postgres, port: 5432, targetPort: postgres}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: shop-db
+  namespace: shop-data
+  labels: {app: shop-db, tier: data}
+spec:
+  serviceName: shop-db
+  replicas: 1
+  selector:
+    matchLabels: {app: shop-db}
+  template:
+    metadata:
+      labels: {app: shop-db, tier: data}
+    spec:
+      containers:
+        - name: postgres
+          image: public.ecr.aws/docker/library/postgres:16-alpine
+          env:
+            - {name: POSTGRES_DB, value: shop}
+            - name: POSTGRES_USER
+              valueFrom: {secretKeyRef: {name: postgres-admin, key: username}}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: postgres-admin, key: password}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports:
+            - {name: postgres, containerPort: 5432}
+          readinessProbe:
+            exec: {command: [sh, -c, 'pg_isready -U "$POSTGRES_USER" -d shop']}
+            periodSeconds: 5
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "1", memory: 512Mi}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: 2Gi}}

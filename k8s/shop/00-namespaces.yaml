@@ -1,0 +1,23 @@
+# KubeShop: una tienda de tres capas, una por namespace.
+#
+#   shop-frontend  la tienda (shop-web) y un generador de tráfico (loadgen)
+#   shop-backend   las APIs (orders-api, catalog-api) y sus credenciales
+#   shop-data      la base: un Service que apunta a RDS (aws) o a un
+#                  PostgreSQL dentro del clúster (local)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop-frontend
+  labels: {app.kubernetes.io/part-of: kubeshop, tier: frontend}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop-backend
+  labels: {app.kubernetes.io/part-of: kubeshop, tier: backend}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop-data
+  labels: {app.kubernetes.io/part-of: kubeshop, tier: data}

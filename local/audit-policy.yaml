@@ -1,0 +1,20 @@
+# Auditoría del API server de kind: el equivalente local de CloudTrail.
+# Nivel Metadata: quién, qué verbo, qué recurso y con qué resultado. Nunca el
+# cuerpo de la petición ni de la respuesta, para que los Secrets no acaben en el log.
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: [RequestReceived]
+rules:
+  # Ruido del propio clúster.
+  - level: None
+    users: [system:kube-proxy, system:kube-scheduler, system:kube-controller-manager, system:apiserver]
+  - level: None
+    userGroups: [system:nodes]
+  - level: None
+    resources:
+      - {group: coordination.k8s.io, resources: [leases]}
+      - {group: "", resources: [events]}
+  - level: None
+    nonResourceURLs: ["/healthz*", "/livez*", "/readyz*", "/version", "/openapi*", "/api", "/apis*"]
+  # Todo lo demás, sin cuerpos.
+  - level: Metadata
